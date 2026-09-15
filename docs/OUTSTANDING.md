@@ -99,8 +99,8 @@ expensive to retrofit onto an invented schema.
 ### A4 · M5.8 - BatchML / B2MML import-export
 
 Explicitly "later" in the M5 roadmap. **The easy kind of standards work:** B2MML/BatchML are
-machine-readable schemas, freely published by MESA, and CLAUDE.md Rule 1 already lists them as an
-approved source - implement from the schema, nothing to interpret. Primer already written:
+machine-readable schemas, freely published by MESA, and already an approved
+source - implement from the schema, nothing to interpret. Primer already written:
 `POL_Recipe_Engine_Design.md` §2.7.
 
 ---

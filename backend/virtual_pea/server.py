@@ -21,6 +21,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import math
+import time
 from pathlib import Path
 
 from asyncua import Server, ua
@@ -112,8 +113,30 @@ class VirtualPEA:
         # can actually show it — the VirtualPEA otherwise advances within one 50 ms scan.
         # Purely a demo aid: it does not change which transitions exist, only their timing.
         self._sc_dwell = {ServiceState.PAUSING: 1.0}  # state -> seconds to hold before SC
+        # How long EXECUTE is held for a SELF-COMPLETING procedure: the applied
+        # value of that procedure's parameter, latched at STARTING. None means no
+        # duration was applied, so EXECUTE self-completes at once (the old
+        # behaviour, and what a procedure with no parameter should still do).
+        self._execute_dwell: float | None = None
+        # procedure id -> that procedure's first parameter node-map, so the dwell
+        # can be read without walking the model again on every start.
+        self._param_by_proc: dict[int, dict[str, object]] = {}
+        # Seconds actually spent IN Execute for the current run, and the monotonic
+        # stamp of the last scan that saw Execute. The duration is counted on this
+        # rather than on wall time since entry, so Pause/Hold SUSPEND the stir and
+        # Resume/Unhold continue it: 10 s of stirring means 10 s of agitation, not
+        # 10 s of clock. [2658-4] does not settle this - it defines the states and
+        # leaves what happens inside Execute to the PEA - so it is our choice, and
+        # it is the one a process engineer expects.
+        self._execute_ran = 0.0
+        self._execute_tick: float | None = None
         self._sc_state: ServiceState | None = None    # transient currently being held
-        self._sc_since = 0.0                          # scan time we entered that state
+        # ⚠ WALL CLOCK, not _elapsed. _elapsed adds a flat 0.05 per scan, but a
+        # scan does real OPC UA work on top of its 50 ms sleep, so the simulated
+        # clock runs slow and a dwell measured on it overshoots (a 4 s stir took
+        # 5.0 s). Dwells are wall-clock; _elapsed still drives the animation,
+        # which does not care.
+        self._sc_since = 0.0                          # time.monotonic() on entry
         self._ns_indexes: dict[str, int] = {}      # namespace URI -> server index
         self._scan_task: asyncio.Task | None = None
 
@@ -179,6 +202,9 @@ class VirtualPEA:
                         for attr, n in parameter.data.nodes.items()
                     }
                     self._parameters.append(nodes)
+                    # first parameter of the procedure is the one a duration
+                    # would live on; setdefault keeps it to that one.
+                    self._param_by_proc.setdefault(procedure.procedure_id, nodes)
                     await self._set_bool(nodes, "StateChannel", False)
                     await self._set_bool(nodes, "SrcChannel", False)
                     await self._set_param_mode(nodes, "Off")
@@ -365,16 +391,45 @@ class VirtualPEA:
             proc = next((p for p in self._service.procedures if p.procedure_id == req), None)
             if proc is not None:
                 self._sm.set_self_completing(proc.is_self_completing)
+                # [2658-4] a procedure's parameters are fixed when it starts, so
+                # the duration is read HERE and held for the whole run rather than
+                # re-read each scan.
+                self._execute_dwell = None
+                self._execute_ran = 0.0
+                self._execute_tick = None
+                nodes = self._param_by_proc.get(req)
+                if proc.is_self_completing and nodes is not None:
+                    seconds = await self._get_float(nodes, "VOut")
+                    if seconds > 0:
+                        self._execute_dwell = seconds
         if self._sm.state in (ServiceState.RESETTING,):
             await self._write("ProcedureCur", 0)
         # Hold a dwelling transient for its configured time before letting SC fire.
         state = self._sm.state
         if state != self._sc_state:
             self._sc_state = state
-            self._sc_since = self._elapsed
-        dwell = self._sc_dwell.get(state)
-        if dwell is not None and self._elapsed - self._sc_since < dwell:
-            return                                  # still lingering — hold the SC transition
+            self._sc_since = time.monotonic()
+        # The Execute clock accumulates only while Execute is actually the state;
+        # anywhere else (Pausing/Paused/Holding/Held/Resuming/Unholding) it stops,
+        # and picks up where it left off on the return to Execute.
+        now = time.monotonic()
+        if state is ServiceState.EXECUTE:
+            if self._execute_tick is not None:
+                self._execute_ran += now - self._execute_tick
+            self._execute_tick = now
+        else:
+            self._execute_tick = None
+        if state is ServiceState.EXECUTE:
+            # A self-completing procedure runs for the duration it was given,
+            # measured in time SPENT executing. A continuous one never
+            # SC-advances out of Execute, so a None dwell there is harmless.
+            if (self._execute_dwell is not None
+                    and self._execute_ran < self._execute_dwell):
+                return                              # still stirring
+        else:
+            dwell = self._sc_dwell.get(state)
+            if dwell is not None and now - self._sc_since < dwell:
+                return                              # still lingering — hold the SC transition
         self._sm.advance()
 
     async def _publish(self) -> None:

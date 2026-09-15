@@ -69,7 +69,7 @@ logs/
 # Runtime SQLite database
 backend/orchestrion.db
 
-# Working notes — deliberately untracked. They live on disk only, like CLAUDE.md,
+# Working notes — deliberately untracked. They live on disk only,
 # which means git does not back them up.
 docs/progress/
 
